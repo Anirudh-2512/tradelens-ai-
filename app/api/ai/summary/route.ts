@@ -39,7 +39,7 @@ export async function POST(request: NextRequest) {
             finnhubProvider.getQuote(symbol)
           );
         } catch {
-          await new Promise((r) => setTimeout(r, 800));
+          await new Promise((r) => setTimeout(r, 1_500));
           return finnhubProvider.getQuote(symbol);
         }
       };

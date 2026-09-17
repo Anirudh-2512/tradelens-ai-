@@ -45,5 +45,7 @@ export const CACHE_TTL = {
   profile: 12 * 60_000,
   candles: 5 * 60_000,
   news: 5 * 60_000,
-  quote: 10_000,
+  // Quote freshness vs provider cap: 25s keeps per-instance bursts well
+  // inside Finnhub's free per-minute limit while remaining near-real-time.
+  quote: 25_000,
 } as const;
