@@ -12,7 +12,7 @@ export function PriceHeader({
   symbol: string;
   companyName?: string;
 }) {
-  const { data, connection, lastUpdated, refresh } = useMarketData([symbol], 10_000);
+  const { data, connection, lastUpdated, refresh } = useMarketData([symbol]);
   const q = data?.[symbol];
 
   return (

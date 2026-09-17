@@ -1,166 +1,217 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useSyncExternalStore, useState, useEffect } from "react";
 import type { Quote } from "@/types/market";
 import type { ConnectionState } from "@/types";
+
+/**
+ * Shared market-data service (spec §14–15).
+ *
+ * A single module-level store drives ALL subscribers: every dashboard
+ * widget (ticker, trending grid, price header) subscribes to the same
+ * poller instead of each starting its own loop. This keeps total
+ * provider traffic bounded regardless of how many components are mounted.
+ *
+ * - Live polling with exponential backoff on failure
+ * - Explicit connection state (never silently stale)
+ * - Retains last known value; marks it stale rather than fabricating
+ */
 
 interface LiveQuote extends Quote {
   state: "live" | "stale" | "unavailable";
   fetchedAt: number;
 }
 
-interface UseMarketDataResult<C> {
-  data: C | null;
+const STALE_THRESHOLD_MS = 45_000;
+const DEFAULT_INTERVAL_MS = 15_000;
+
+interface StoreState {
+  quotes: Record<string, LiveQuote>;
   connection: ConnectionState;
   lastUpdated: number | null;
   error: string | null;
-  refresh: () => Promise<void>;
 }
 
-const STALE_THRESHOLD_MS = 45_000;
-const CONNECT_TIMEOUT_MS = 12_000;
+class PollStore {
+  private listeners = new Set<() => void>();
+  private subs = new Set<string>();
+  private state: StoreState = {
+    quotes: {},
+    connection: "CONNECTING",
+    lastUpdated: null,
+    error: null,
+  };
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private attempts = 0;
+  private inFlight = false;
 
-function classifyQuote(q: LiveQuote): LiveQuote {
-  if (q.state === "live" && Date.now() - q.fetchedAt > STALE_THRESHOLD_MS) {
-    return { ...q, state: "stale" };
+  subscribe(symbols: string[], onChange: () => void): () => void {
+    const key = symbols.sort().join(",");
+    this.subs.add(key);
+    this.listeners.add(onChange);
+    this.startLoop(symbols);
+    return () => {
+      this.subs.delete(key);
+      this.listeners.delete(onChange);
+      if (this.listeners.size === 0) this.stop();
+    };
   }
-  return q;
-}
 
-/**
- * Near-real-time market data hook (spec §14–15).
- *
- * Finnhub's free tier does not expose authenticated WSS streams to all
- * users, so this service uses resilient polling with:
- *  - explicit connection state (LIVE / CONNECTING / RECONNECTING / OFFLINE)
- *  - stale detection without fabricating data
- *  - exponential backoff reconnection
- */
-export function useMarketData(
-  symbols: string[],
-  intervalMs = 10_000
-): UseMarketDataResult<Record<string, LiveQuote>> {
-  const [quotes, setQuotes] = useState<Record<string, LiveQuote> | null>(null);
-  const [connection, setConnection] = useState<ConnectionState>("CONNECTING");
-  const [lastUpdated, setLastUpdated] = useState<number | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  getSnapshot(): StoreState {
+    return this.state;
+  }
 
-  const symbolsKey = symbols.sort().join(",");
-  const attemptRef = useRef(0);
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const mountedRef = useRef(true);
+  private emit() {
+    for (const l of this.listeners) l();
+  }
 
-  const fetchQuotes = useCallback(async () => {
-    if (!symbolsKey) return;
+  private startLoop(symbols: string[]) {
+    if (this.timer) return; // already polling
+    const run = () => {
+      this.timer = setTimeout(async () => {
+        await this.fetchAll(symbols);
+        if (this.listeners.size === 0) {
+          this.timer = null;
+          return;
+        }
+        const backoff =
+          this.attempts > 0
+            ? Math.min(DEFAULT_INTERVAL_MS * 2 ** Math.min(this.attempts, 4), 120_000)
+            : DEFAULT_INTERVAL_MS;
+        if (backoff < 120_000) run();
+        else this.timer = null;
+      }, 0);
+    };
+    run();
+  }
+
+  private stop() {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    this.attempts = 0;
+  }
+
+  private async fetchAll(symbols: string[]) {
+    const key = [...new Set(symbols)].sort().join(",");
+    if (!key) return;
     try {
-      const res = await fetch(`/api/stocks/quotes?symbols=${symbolsKey}`);
+      const res = await fetch(`/api/stocks/quotes?symbols=${key}`);
       const json = await res.json();
-      if (!mountedRef.current) return;
-
       if (!res.ok || !json.success) {
         throw new Error(json?.error?.message ?? "Market data unavailable");
       }
 
-      type RawQuote = Quote & { state?: string };
-      const raw = (json.data.codes ?? []) as RawQuote[];
-      void raw;
-      const next: Record<string, LiveQuote> = {};
+      const next: Record<string, LiveQuote> = { ...this.state.quotes };
+      const now = Date.now();
       for (const item of json.data.quotes as Array<Quote & { state: string }>) {
-        next[item.symbol] = {
-          ...item,
-          state: item.state === "unavailable" ? "unavailable" : "live",
-          fetchedAt: Date.now(),
-        };
-      }
-      setQuotes((prev) => {
-        // Retain last known value when a symbol goes unavailable (spec §15).
-        const merged = { ...prev, ...next };
-        for (const [sym, q] of Object.entries(merged)) {
-          merged[sym] = classifyQuote({ ...q, symbol: sym } as LiveQuote);
+        const prev = this.state.quotes[item.symbol];
+        if (item.state === "unavailable" && prev) {
+          // retain last known value, flag stale (spec §15)
+          next[item.symbol] = { ...prev, state: prev.fetchedAt + STALE_THRESHOLD_MS < now ? "stale" : prev.state };
+        } else {
+          next[item.symbol] = {
+            ...item,
+            state: item.state === "unavailable" ? "unavailable" : "live",
+            fetchedAt: now,
+          };
         }
-        return merged;
-      });
-      setLastUpdated(Date.now());
-      setConnection("LIVE");
-      setError(null);
-      attemptRef.current = 0;
+      }
+      this.state = {
+        quotes: this.markStale(next),
+        connection: "LIVE",
+        lastUpdated: now,
+        error: null,
+      };
+      this.attempts = 0;
     } catch (err) {
-      if (!mountedRef.current) return;
-      attemptRef.current += 1;
-
-      if (attemptRef.current === 1) {
-        setConnection("RECONNECTING");
-      } else if (attemptRef.current >= 4) {
-        setConnection("OFFLINE");
-      }
-      setError(err instanceof Error ? err.message : "Market data error");
-
-      // Mark existing values stale.
-      setQuotes((prev) => {
-        if (!prev) return prev;
-        const merged: Record<string, LiveQuote> = {};
-        for (const [sym, q] of Object.entries(prev)) {
-          merged[sym] = { ...q, state: q.state === "unavailable" ? "unavailable" : "stale" };
-        }
-        return merged;
-      });
+      this.attempts += 1;
+      this.state = {
+        ...this.state,
+        connection:
+          this.attempts <= 1
+            ? "RECONNECTING"
+            : this.attempts >= 4
+              ? "OFFLINE"
+              : this.state.connection === "OFFLINE"
+                ? "OFFLINE"
+                : "RECONNECTING",
+        error: err instanceof Error ? err.message : "Market data error",
+        quotes: this.markStale(this.state.quotes),
+      };
     }
-  }, [symbolsKey]);
+    this.emit();
+  }
 
-  useEffect(() => {
-    mountedRef.current = true;
+  private markStale(
+    quotes: Record<string, LiveQuote>
+  ): Record<string, LiveQuote> {
+    const now = Date.now();
+    const out: Record<string, LiveQuote> = {};
+    for (const [sym, q] of Object.entries(quotes)) {
+      out[sym] = {
+        ...q,
+        state:
+          q.state === "unavailable"
+            ? "unavailable"
+            : now - q.fetchedAt > STALE_THRESHOLD_MS
+              ? "stale"
+              : q.state,
+      };
+    }
+    return out;
+  }
 
-    const loop = () => {
-      timerRef.current = setTimeout(async () => {
-        await fetchQuotes();
-        if (!mountedRef.current) return;
-        // Backoff on failure: 10s → 20s → 40s → off
-        const backoff =
-          attemptRef.current > 0
-            ? Math.min(intervalMs * 2 ** attemptRef.current, 120_000)
-            : intervalMs;
-        if (backoff < 120_000) loop();
-      }, 100);
-    };
-    loop();
-
-    const watchdog = setInterval(() => {
-      if (!mountedRef.current) return;
-      if (
-        connection === "LIVE" &&
-        lastUpdated &&
-        Date.now() - lastUpdated > CONNECT_TIMEOUT_MS + intervalMs
-      ) {
-        setConnection("RECONNECTING");
-        fetchQuotes();
-      }
-    }, 15_000);
-
-    return () => {
-      mountedRef.current = false;
-      if (timerRef.current) clearTimeout(timerRef.current);
-      clearInterval(watchdog);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [symbolsKey]);
-
-  useEffect(() => {
-    const tick = setInterval(() => {
-      setQuotes((prev) => {
-        if (!prev) return prev;
-        const merged: Record<string, LiveQuote> = {};
-        for (const [sym, q] of Object.entries(prev)) {
-          merged[sym] = classifyQuote({ ...q, symbol: sym } as LiveQuote);
-        }
-        return merged;
-      });
-    }, 10_000);
-    return () => clearInterval(tick);
-  }, []);
-
-  const refresh = useCallback(async () => {
-    await fetchQuotes();
-  }, [fetchQuotes]);
-
-  return { data: quotes, connection, lastUpdated, error, refresh };
+  async refresh(symbols: string[]) {
+    await this.fetchAll(symbols);
+  }
 }
+
+const store = new PollStore();
+
+export function useMarketData(
+  symbols: string[],
+  _intervalMs = 15_000
+): {
+  data: Record<string, LiveQuote> | null;
+  connection: ConnectionState;
+  lastUpdated: number | null;
+  error: string | null;
+  refresh: () => Promise<void>;
+} {
+  void _intervalMs;
+  const [key, setKey] = useState(() => symbols.sort().join(","));
+  const snapshot = useSyncExternalStore(
+    (cb) => store.subscribe(symbols, cb),
+    () => store.getSnapshot(),
+    () => null
+  );
+
+  // Re-subscribe when the symbol set changes identity.
+  useEffect(() => {
+    const k = symbols.sort().join(",");
+    if (k !== key) setKey(k);
+  }, [symbols, key]);
+
+  function mapData(s: StoreState | null): Record<string, LiveQuote> | null {
+    if (s === null) return null;
+    const entries = key.split(",").filter(Boolean);
+    if (entries.length === 0) return null;
+    if (!(entries[0] in s.quotes)) return null;
+    const out: Record<string, LiveQuote> = {};
+    for (const sym of entries) {
+      if (s.quotes[sym]) out[sym] = s.quotes[sym];
+    }
+    return out;
+  }
+
+  const data = key ? mapData(snapshot) : null;
+
+  return {
+    data: key ? (data ?? null) : null,
+    connection: snapshot?.connection ?? "CONNECTING",
+    lastUpdated: snapshot?.lastUpdated ?? null,
+    error: snapshot?.error ?? null,
+    refresh: () => store.refresh(symbols),
+  };
+}
+

@@ -7,7 +7,7 @@ import { formatCurrency, formatPercent, cn } from "@/lib/utils/format";
 import { Skeleton } from "@/components/ui/Skeleton";
 
 export function TrendingMarkets() {
-  const { data } = useMarketData([...DEFAULT_SYMBOLS], 15_000);
+  const { data } = useMarketData([...DEFAULT_SYMBOLS]);
 
   return (
     <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">

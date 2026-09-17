@@ -8,7 +8,7 @@ import { DEFAULT_SYMBOLS } from "@/constants";
 import { Skeleton } from "@/components/ui/Skeleton";
 
 export function MarketTicker() {
-  const { data, connection, lastUpdated } = useMarketData([...DEFAULT_SYMBOLS], 12_000);
+  const { data, connection, lastUpdated } = useMarketData([...DEFAULT_SYMBOLS]);
 
   return (
     <div className="flex items-center gap-3 overflow-x-auto pb-1">
