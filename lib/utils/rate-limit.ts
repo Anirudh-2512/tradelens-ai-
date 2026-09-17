@@ -58,12 +58,14 @@ export function rateLimit(
   return { allowed: true, remaining: limit - bucket.timestamps.length };
 }
 
-/** Rate limit presets aligned to the spec's sensitive endpoints. */
+/** Rate limit presets aligned to the spec's sensitive endpoints.
+ *  Note: the server-side quote cache bounds upstream provider usage,
+ *  so read-only market endpoints can be generous with clients. */
 export const rateLimitPresets = {
   auth: (id: string) => rateLimit(`auth:${id}`, 10, 5 * 60_000),
   ai: (id: string) => rateLimit(`ai:${id}`, 10, 60_000),
-  stocks: (id: string) => rateLimit(`stocks:${id}`, 60, 60_000),
-  news: (id: string) => rateLimit(`news:${id}`, 30, 60_000),
+  stocks: (id: string) => rateLimit(`stocks:${id}`, 240, 60_000),
+  news: (id: string) => rateLimit(`news:${id}`, 120, 60_000),
 } as const;
 
 export function clientIp(request: Request): string {
