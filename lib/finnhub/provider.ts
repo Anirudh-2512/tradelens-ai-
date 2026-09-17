@@ -20,9 +20,17 @@ const FINNHUB_TTL = {
 
 class FinnhubError extends Error {}
 
+/** Historical candles are premium-only on Finnhub's free plan (HTTP 403). */
+const CANDLES_NOT_CONFIGURED = () => ({
+  code: "CANDLES_UNAVAILABLE_ON_PLAN",
+  message:
+    "Historical chart data is not included in the current market-data plan. Live quotes, news and AI analysis remain available.",
+});
+
 async function finnhubRequest<T>(
   path: string,
-  params: Record<string, string>
+  params: Record<string, string>,
+  on403?: () => { code: string; message: string; status: number }
 ): Promise<T> {
   const url = new URL(`https://finnhub.io/api/v1${path}`);
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
@@ -43,6 +51,9 @@ async function finnhubRequest<T>(
 
   if (res.status === 429) {
     throw errors.rateLimited("Market data request limit reached. Please slow down.");
+  }
+  if (res.status === 403 && on403) {
+    throw on403();
   }
   if (!res.ok) {
     logger.error("finnhub.http_failure", `finnhub${path}`, { status: res.status });
@@ -143,12 +154,16 @@ export const finnhubProvider: MarketDataProvider = {
   },
 
   async getCandles(symbol, options: CandleOptions) {
-    const raw = await finnhubRequest<FinnCandles>("/stock/candle", {
-      symbol,
-      resolution: options.resolution,
-      from: String(options.from),
-      to: String(options.to),
-    });
+    const raw = await finnhubRequest<FinnCandles>(
+      "/stock/candle",
+      {
+        symbol,
+        resolution: options.resolution,
+        from: String(options.from),
+        to: String(options.to),
+      },
+      () => ({ ...CANDLES_NOT_CONFIGURED(), status: 503 })
+    );
     return normalizeCandles(raw);
   },
 
