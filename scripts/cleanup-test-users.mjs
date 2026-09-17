@@ -29,7 +29,7 @@ const emails = [
   "prodcheck@example.com",
   "prodcheck2@example.com",
   "t4check@example.com",
-  "t5check@example.com",
+  "t5check@example.com", "t6check@example.com",
 ];
 
 const ph = emails.map(() => "?").join(",");
