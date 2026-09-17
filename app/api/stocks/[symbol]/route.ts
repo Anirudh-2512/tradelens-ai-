@@ -21,7 +21,12 @@ export async function GET(
     if (!parsed.success) throw errors.badRequest("Invalid symbol.");
     const symbol = parsed.data;
 
-    const quote = await finnhubProvider.getQuote(symbol);
+    // Short-TTL cache protects the free provider cap under page polling.
+    const quote = await cached(
+      `quote:${symbol}`,
+      CACHE_TTL.quote,
+      () => finnhubProvider.getQuote(symbol)
+    );
     const profile = await cached(
       `finnhub:profile:${symbol}`,
       CACHE_TTL.profile,
