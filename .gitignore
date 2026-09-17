@@ -35,3 +35,5 @@ yarn-error.log*
 .idea
 .next-dev.log
 .next-dev.log
+.vercel
+.env*
