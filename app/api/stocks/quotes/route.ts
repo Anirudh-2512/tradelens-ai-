@@ -1,11 +1,25 @@
 import { NextRequest, NextResponse } from "next/server";
 import { symbolSchema } from "@/lib/validation/schemas";
-import { finnhubProvider } from "@/lib/finnhub";
+import { getQuoteShared } from "@/lib/finnhub/quote-cache";
 import { errors, getRequestId, handleApiError } from "@/lib/utils/api";
 import { clientIp, rateLimitPresets } from "@/lib/utils/rate-limit";
-import { cached, CACHE_TTL } from "@/lib/utils/cache";
+import type { Quote } from "@/types/market";
 
-/** Batch quotes for a small list of symbols (max 12), used by ticker/watchlist. */
+function nullQuote(symbol: string): Quote {
+  return {
+    symbol,
+    price: null,
+    change: null,
+    changePercent: null,
+    dayHigh: null,
+    dayLow: null,
+    dayOpen: null,
+    previousClose: null,
+    timestamp: null,
+  };
+}
+
+/** Batch quotes with a shared cross-instance cache (max 12 symbols). */
 export async function GET(request: NextRequest) {
   const requestId = getRequestId();
   const endpoint = "GET /api/stocks/quotes";
@@ -26,34 +40,26 @@ export async function GET(request: NextRequest) {
       throw errors.badRequest("Provide up to 12 valid symbols (?symbols=AAPL,MSFT).");
     }
 
-    // Server-side 10s dedupe: several dashboard widgets poll the same
-    // symbols; without this, Finnhub's free-tier per-minute cap gets
-    // exhausted within a minute of an open dashboard (spec §44).
+    // Shared cache: repeated widget polls collapse to a provider call only
+    // when the DB row is older than QUOTE_FRESH_MS.
     const settled = await Promise.allSettled(
-      symbols.map((s) =>
-        cached(`quote:${s}`, CACHE_TTL.quote, () => finnhubProvider.getQuote(s))
-      )
+      symbols.map((symbol) => getQuoteShared(symbol))
     );
 
     const quotes = symbols.map((symbol, i) => {
       const result = settled[i];
       if (result.status === "fulfilled") {
-        return { ...result.value, symbol, state: "live" as const };
+        return {
+          ...result.value.quote,
+          state: result.value.fresh ? ("live" as const) : ("stale" as const),
+        };
       }
-      return {
-        symbol,
-        price: null, change: null, changePercent: null, dayHigh: null,
-        dayLow: null, dayOpen: null, previousClose: null, timestamp: null,
-        state: "unavailable" as const,
-      };
+      return { ...nullQuote(symbol), state: "unavailable" as const };
     });
 
     return NextResponse.json({
       success: true,
-      data: {
-        quotes,
-        asOf: new Date().toISOString(),
-      },
+      data: { quotes, asOf: new Date().toISOString() },
     });
   } catch (err) {
     return handleApiError(err, { endpoint, requestId });

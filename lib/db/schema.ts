@@ -95,4 +95,11 @@ CREATE TABLE IF NOT EXISTS email_verification_tokens (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_evt_user_id ON email_verification_tokens(user_id);
+
+-- Shared cross-instance quote cache (last row stays as last-known fallback)
+CREATE TABLE IF NOT EXISTS quotes_cache (
+  symbol TEXT PRIMARY KEY,
+  payload TEXT NOT NULL,
+  fetched_at INTEGER NOT NULL
+);
 `;

@@ -5,12 +5,13 @@ import { finnhubProvider } from "@/lib/finnhub";
 import { computeRSI, computeMACD, computeBollingerBands } from "@/lib/indicators";
 import { timeframeToCandleOptions } from "@/constants";
 import { getFinnhubNews } from "@/lib/finnhub/news";
+import { getQuoteShared } from "@/lib/finnhub/quote-cache";
 import { aiProvider } from "@/lib/groq/provider";
 import { errors, getRequestId, handleApiError } from "@/lib/utils/api";
 import { cached, CACHE_TTL } from "@/lib/utils/cache";
 import { clientIp, rateLimit } from "@/lib/utils/rate-limit";
 import { getDb } from "@/lib/db/client";
-import type { Candle, CandleOptions, CompanyProfile, MarketAnalysisInput, NewsArticle, Quote } from "@/types/market";
+import type { Candle, CandleOptions, CompanyProfile, MarketAnalysisInput, NewsArticle } from "@/types/market";
 
 export async function POST(request: NextRequest) {
   const requestId = getRequestId();
@@ -32,26 +33,16 @@ export async function POST(request: NextRequest) {
     // Assemble context strictly from real sources (spec §21, §57).
     const cacheKey = `ai:summary:${symbol}:${Math.floor(Date.now() / (5 * 60_000))}`;
     const summary = await cached(cacheKey, CACHE_TTL.quote * 30, async () => {
-      // Reuse the shared short-TTL quote cache; retry once before giving up.
-      const getQuoteWithRetry = async () => {
-        try {
-          return await cached(`quote:${symbol}`, CACHE_TTL.quote, () =>
-            finnhubProvider.getQuote(symbol)
-          );
-        } catch {
-          await new Promise((r) => setTimeout(r, 1_500));
-          return finnhubProvider.getQuote(symbol);
-        }
-      };
-
+      // Shared cross-instance cache; a stale-but-true last price is fine.
       const [quoteRes, profileRes, candlesRes, newsRes] = await Promise.allSettled([
-        getQuoteWithRetry(),
+        getQuoteShared(symbol),
         finnhubProvider.getCompanyProfile(symbol),
         getCandlesSafe(symbol, timeframeToCandleOptions("3M")),
         getNewsSafe(symbol),
       ]);
 
-      const quote: Quote | null = quoteRes.status === "fulfilled" ? quoteRes.value : null;
+      const quoteEnv = quoteRes.status === "fulfilled" ? quoteRes.value : null;
+      const quote = quoteEnv?.quote ?? null;
       if (!quote || quote.price == null) throw errors.marketDataUnavailable();
 
       const profile: CompanyProfile | null = profileRes.status === "fulfilled" ? profileRes.value : null;
@@ -114,6 +105,9 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ success: true, data: summary });
   } catch (err) {
     void getDb;
+    if (err instanceof Error && err.message === "AI_UNAVAILABLE") {
+      return handleApiError(errors.aiUnavailable(), { endpoint, requestId });
+    }
     return handleApiError(err, { endpoint, requestId });
   }
 }
