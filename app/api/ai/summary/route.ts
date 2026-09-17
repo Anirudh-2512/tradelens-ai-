@@ -32,8 +32,20 @@ export async function POST(request: NextRequest) {
     // Assemble context strictly from real sources (spec §21, §57).
     const cacheKey = `ai:summary:${symbol}:${Math.floor(Date.now() / (5 * 60_000))}`;
     const summary = await cached(cacheKey, CACHE_TTL.quote * 30, async () => {
+      // Reuse the shared short-TTL quote cache; retry once before giving up.
+      const getQuoteWithRetry = async () => {
+        try {
+          return await cached(`quote:${symbol}`, CACHE_TTL.quote, () =>
+            finnhubProvider.getQuote(symbol)
+          );
+        } catch {
+          await new Promise((r) => setTimeout(r, 800));
+          return finnhubProvider.getQuote(symbol);
+        }
+      };
+
       const [quoteRes, profileRes, candlesRes, newsRes] = await Promise.allSettled([
-        finnhubProvider.getQuote(symbol),
+        getQuoteWithRetry(),
         finnhubProvider.getCompanyProfile(symbol),
         getCandlesSafe(symbol, timeframeToCandleOptions("3M")),
         getNewsSafe(symbol),

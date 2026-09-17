@@ -8,14 +8,18 @@ import { Skeleton } from "@/components/ui/Skeleton";
 import { AI_DISCLAIMER } from "@/constants";
 import type { MarketSummary } from "@/types/market";
 
+class RateLimitError extends Error {}
+
 export function AISummaryCard({ symbol }: { symbol: string }) {
   const [summary, setSummary] = useState<MarketSummary | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [rateLimited, setRateLimited] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
+    setRateLimited(false);
     try {
       const res = await fetch("/api/ai/summary", {
         method: "POST",
@@ -24,11 +28,19 @@ export function AISummaryCard({ symbol }: { symbol: string }) {
       });
       const json = await res.json();
       if (!res.ok || !json.success) {
+        if (json?.error?.code === "RATE_LIMITED") {
+          throw new RateLimitError(json.error.message ?? "AI generation is rate-limited.");
+        }
         throw new Error(json?.error?.message ?? "AI analysis unavailable");
       }
       setSummary(json.data);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "AI analysis unavailable");
+      if (err instanceof RateLimitError) {
+        setRateLimited(true);
+        setError("AI generation is rate-limited.");
+      } else {
+        setError(err instanceof Error ? err.message : "AI analysis unavailable");
+      }
     } finally {
       setLoading(false);
     }
@@ -60,7 +72,9 @@ export function AISummaryCard({ symbol }: { symbol: string }) {
         ) : error ? (
           <div className="flex flex-col items-center gap-2 py-6 text-center">
             <TriangleAlert className="h-5 w-5 text-[var(--warning)]" />
-            <p className="text-xs text-[var(--muted)]">{error}. AI generation is rate-limited — retry shortly.</p>
+            <p className="text-xs text-[var(--muted)]">
+              {error} {rateLimited ? "Please wait a minute and retry." : "Please retry shortly."}
+            </p>
             <button onClick={() => void load()} className="text-xs text-[var(--gold)] hover:underline">
               Retry
             </button>
